@@ -20,7 +20,7 @@
 
 #feature-info  Converts files and folders (recursively) to compressed XISF next to each source.
 
-#define VERSION            "1.0.0"
+#define VERSION            "1.0.1"
 #define TITLE              "BatchFormatConversionRecursive"
 #define DEFAULT_CODEC      "lz4hc+sh"
 #define DEFAULT_EXTENSIONS ".fits;.fit;.fts"
@@ -35,11 +35,7 @@ const CODECS = [ "lz4hc+sh", "lz4+sh", "zstd+sh", "zlib+sh", "lz4hc", "zstd", "z
 
 function scriptArguments()
 {
-   if ( typeof Runtime !== "undefined" && Runtime.jsArguments && Runtime.jsArguments.length )
-      return Runtime.jsArguments;
-   if ( typeof jsArguments !== "undefined" && jsArguments )
-      return jsArguments;
-   return [];
+   return Runtime.jsArguments || [];
 }
 
 function csvField( text )
