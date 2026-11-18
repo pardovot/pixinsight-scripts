@@ -25,7 +25,7 @@
 
 #feature-info  Converts files and folders (recursively) to compressed XISF next to each source.
 
-#define VERSION            "1.1.0"
+#define VERSION            "1.1.1"
 #define TITLE              "BatchFormatConversionRecursive"
 #define DEFAULT_CODEC      "zstd+sh"
 #define DEFAULT_LEVEL      25
@@ -161,14 +161,17 @@ class ConversionEngine
       let descriptions = reader.open( sourcePath, "non-interactive" );
       if ( descriptions == null || descriptions.length == 0 )
          throw new Error( "Unable to open file" );
+      // Extra images are extensions such as the thumbnail and astrometric solution PixInsight adds
+      // when it re-saves a solved FITS; the first image is the frame itself.
       if ( descriptions.length > 1 )
-         throw new Error( "Multi-image files are not supported" );
+         reader.selectedImageIndex = 0;
       let description = descriptions[0];
       let image = new Image( 1, 1, 1, ColorSpace.Gray, description.bitsPerSample,
                              description.ieeefpSampleFormat ? PixelSampleType.Float : PixelSampleType.Integer );
       if ( !reader.readImage( image ) )
          throw new Error( "Unable to read image data" );
       let source = {
+         imageCount: descriptions.length,
          image: image,
          description: description,
          keywords: reader.format.canStoreKeywords ? reader.keywords : undefined,
@@ -235,7 +238,10 @@ class ConversionEngine
       let outputPath = File.changeExtension( sourcePath, OUTPUT_EXTENSION );
       if ( File.exists( outputPath ) && !this.overwriteExisting )
          return this.record( sourcePath, outputPath, "skipped", "output exists" );
-      let temporaryPath = this.writeTemporary( this.readSource( sourcePath ), outputPath, outputFormat );
+      let source = this.readSource( sourcePath );
+      if ( source.imageCount > 1 )
+         detail += ", first of " + source.imageCount + " images";
+      let temporaryPath = this.writeTemporary( source, outputPath, outputFormat );
       if ( File.exists( outputPath ) )
          File.remove( outputPath );
       File.move( temporaryPath, outputPath );
