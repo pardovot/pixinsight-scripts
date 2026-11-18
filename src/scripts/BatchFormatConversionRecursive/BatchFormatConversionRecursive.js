@@ -3,16 +3,21 @@
 // Converts image files to compressed XISF, taking files and whole folders (recursive), and writes
 // each output next to its source with the same name, so a folder tree keeps its layout.
 // Read/write follows the stock BatchFormatConversion script: keywords, image properties, metadata,
-// ICC profile and thumbnail are carried over. Sources are never modified or deleted.
+// ICC profile and thumbnail are carried over. FITS sources are never modified or deleted.
+// With recompress, XISF files in another codec are rewritten in place and the original is kept as
+// <name>.xisf.orig until a verification step removes it.
 //
 // Automation (no dialog), e.g. from IPC:
 //   PixInsight.exe -n --automation-mode -r="<this script>,list=<file>,manifest=<file.csv>" --force-exit
 // Arguments, one key=value each (IPC splits at commas, so paths go in the list file):
-//   list=      text file, one file or folder per line
-//   manifest=  CSV appended with source,output,status,detail per file
-//   codec=     XISF compression codec, default lz4hc+sh
-//   extensions=semicolon separated input suffixes, default .fits;.fit;.fts
-//   overwrite= true to replace an existing output, default false (existing outputs are skipped)
+//   list=       text file, one file or folder per line
+//   manifest=   CSV appended with source,output,status,detail per file
+//   codec=      XISF compression codec, default zstd+sh
+//   level=      compression level 1-100, 0 for the codec default, default 25
+//   checksum=   sha-1, sha-256, sha-512 or none, default sha-1
+//   extensions= semicolon separated input suffixes, default .fits;.fit;.fts
+//   recompress= true to also rewrite .xisf files stored with another codec
+//   overwrite=  true to replace an existing XISF converted from FITS, default false (skipped)
 
 #engine v8
 
@@ -20,23 +25,24 @@
 
 #feature-info  Converts files and folders (recursively) to compressed XISF next to each source.
 
-#define VERSION            "1.0.1"
+#define VERSION            "1.1.0"
 #define TITLE              "BatchFormatConversionRecursive"
-#define DEFAULT_CODEC      "lz4hc+sh"
+#define DEFAULT_CODEC      "zstd+sh"
+#define DEFAULT_LEVEL      25
+#define DEFAULT_CHECKSUM   "sha-1"
 #define DEFAULT_EXTENSIONS ".fits;.fit;.fts"
 #define OUTPUT_EXTENSION   ".xisf"
 #define TEMP_SUFFIX        ".partial"
+#define ORIGINAL_SUFFIX    ".orig"
+#define HEADER_PROBE_BYTES 65536
+#define XISF_PREAMBLE_BYTES 16
 
 CoreApplication.ensureMinimumVersion( 1, 9, 6 );
 
 #include <pjsr/utility/ScriptErrors.js>
 
-const CODECS = [ "lz4hc+sh", "lz4+sh", "zstd+sh", "zlib+sh", "lz4hc", "zstd", "zlib", "none" ];
-
-function scriptArguments()
-{
-   return Runtime.jsArguments || [];
-}
+const CODECS = [ "zstd+sh", "lz4hc+sh", "lz4+sh", "zlib+sh", "zstd", "lz4hc", "lz4", "zlib", "none" ];
+const CHECKSUMS = [ "sha-1", "sha-256", "sha-512", "none" ];
 
 function csvField( text )
 {
@@ -49,12 +55,28 @@ function parseSuffixes( text )
    return text.toLowerCase().split( ";" ).map( suffix => suffix.trim() ).filter( suffix => suffix.length );
 }
 
+// Codec named in an XISF header, "none" when the image is stored uncompressed.
+function xisfCodec( path )
+{
+   let file = new File;
+   file.openForReading( path );
+   // The XML header follows a 16 byte binary preamble, whose zero bytes would end the string early.
+   file.seek( XISF_PREAMBLE_BYTES );
+   let bytes = file.read( DataType.ByteArray, Math.min( HEADER_PROBE_BYTES, file.size - XISF_PREAMBLE_BYTES ) );
+   file.close();
+   let match = bytes.toString().match( /compression="([^:"]+)/ );
+   return match ? match[1] : "none";
+}
+
 class ConversionEngine
 {
    inputs = [];
    recursive = true;
    extensions = parseSuffixes( DEFAULT_EXTENSIONS );
    codec = DEFAULT_CODEC;
+   level = DEFAULT_LEVEL;
+   checksum = DEFAULT_CHECKSUM;
+   recompress = false;
    overwriteExisting = false;
    manifestPath = "";
    converted = 0;
@@ -63,7 +85,21 @@ class ConversionEngine
 
    wantsFile( path )
    {
-      return this.extensions.indexOf( File.extractExtension( path ).toLowerCase() ) >= 0;
+      let suffix = File.extractExtension( path ).toLowerCase();
+      return this.extensions.indexOf( suffix ) >= 0 || (this.recompress && suffix == OUTPUT_EXTENSION);
+   }
+
+   outputHints()
+   {
+      let hints = [ "non-interactive" ];
+      if ( this.codec != "none" )
+      {
+         hints.push( "compression-codec " + this.codec );
+         if ( this.level > 0 )
+            hints.push( "compression-level " + this.level );
+      }
+      hints.push( this.checksum == "none" ? "no-checksums" : "checksums " + this.checksum );
+      return hints.join( " " );
    }
 
    // Expands the input list into files, walking folders (recursively when enabled).
@@ -116,14 +152,8 @@ class ConversionEngine
       manifest.close();
    }
 
-   convertFile( sourcePath, outputFormat )
+   readSource( sourcePath )
    {
-      let outputPath = File.changeExtension( sourcePath, OUTPUT_EXTENSION );
-      if ( outputPath.toLowerCase() == sourcePath.toLowerCase() )
-         return this.record( sourcePath, outputPath, "failed", "output would replace the source" );
-      if ( File.exists( outputPath ) && !this.overwriteExisting )
-         return this.record( sourcePath, outputPath, "skipped", "output exists" );
-
       let inputFormat = new FileFormat( File.extractExtension( sourcePath ).toLowerCase(), true/*toRead*/, false/*toWrite*/ );
       if ( inputFormat.isNull )
          throw new Error( "No installed file format can read this file" );
@@ -138,50 +168,78 @@ class ConversionEngine
                              description.ieeefpSampleFormat ? PixelSampleType.Float : PixelSampleType.Integer );
       if ( !reader.readImage( image ) )
          throw new Error( "Unable to read image data" );
-
-      let keywords = reader.format.canStoreKeywords ? reader.keywords : undefined;
-      let iccProfile = reader.format.canStoreICCProfiles ? reader.iccProfile : undefined;
-      let metadata = reader.format.canStoreMetadata ? reader.metadata : undefined;
-      let thumbnail = reader.format.canStoreThumbnails ? reader.thumbnail : undefined;
-      let properties = [];
+      let source = {
+         image: image,
+         description: description,
+         keywords: reader.format.canStoreKeywords ? reader.keywords : undefined,
+         iccProfile: reader.format.canStoreICCProfiles ? reader.iccProfile : undefined,
+         metadata: reader.format.canStoreMetadata ? reader.metadata : undefined,
+         thumbnail: reader.format.canStoreThumbnails ? reader.thumbnail : undefined,
+         properties: []
+      };
       if ( reader.format.canStoreImageProperties && reader.format.supportsViewProperties )
          for ( let entry of reader.imageProperties )
          {
             let value = reader.readImageProperty( entry[0] );
             if ( value != null )
-               properties.push( { id: entry[0], type: entry[1], value: value } );
+               source.properties.push( { id: entry[0], type: entry[1], value: value } );
          }
       reader.close();
+      return source;
+   }
 
-      // Written under a temporary name and renamed when complete, so an interrupted run never
-      // leaves a truncated file that looks finished.
+   // Writes under a temporary name, so an interrupted run never leaves a truncated file that
+   // looks finished. Returns the temporary path for the caller to rename.
+   writeTemporary( source, outputPath, outputFormat )
+   {
       let temporaryPath = outputPath + TEMP_SUFFIX;
       if ( File.exists( temporaryPath ) )
          File.remove( temporaryPath );
       let writer = new FileFormatInstance( outputFormat );
-      let hints = "non-interactive" + (this.codec == "none" ? "" : " compression-codec " + this.codec);
-      if ( !writer.create( temporaryPath, hints ) )
+      if ( !writer.create( temporaryPath, this.outputHints() ) )
          throw new Error( "Unable to create output file" );
-      let outputDescription = new ImageDescription( description );
-      outputDescription.bitsPerSample = image.bitsPerSample;
-      outputDescription.ieeefpSampleFormat = image.isReal;
+      let outputDescription = new ImageDescription( source.description );
+      outputDescription.bitsPerSample = source.image.bitsPerSample;
+      outputDescription.ieeefpSampleFormat = source.image.isReal;
       if ( !writer.setOptions( outputDescription ) )
          throw new Error( "Unable to set output options" );
-      if ( iccProfile != undefined && outputFormat.canStoreICCProfiles ) writer.iccProfile = iccProfile;
-      if ( keywords != undefined ) writer.keywords = keywords;
-      if ( metadata != undefined && outputFormat.canStoreMetadata ) writer.metadata = metadata;
-      if ( thumbnail != undefined && outputFormat.canStoreThumbnails ) writer.thumbnail = thumbnail;
-      for ( let property of properties )
+      if ( source.iccProfile != undefined && outputFormat.canStoreICCProfiles ) writer.iccProfile = source.iccProfile;
+      if ( source.keywords != undefined ) writer.keywords = source.keywords;
+      if ( source.metadata != undefined && outputFormat.canStoreMetadata ) writer.metadata = source.metadata;
+      if ( source.thumbnail != undefined && outputFormat.canStoreThumbnails ) writer.thumbnail = source.thumbnail;
+      for ( let property of source.properties )
          writer.writeImageProperty( property.id, property.value, property.type );
-      if ( !writer.writeImage( image ) )
+      if ( !writer.writeImage( source.image ) )
          throw new Error( "Unable to write image data" );
       writer.close();
-      image.free();
+      source.image.free();
+      return temporaryPath;
+   }
 
+   convertFile( sourcePath, outputFormat )
+   {
+      let detail = this.codec + (this.level > 0 ? " level " + this.level : "") + ", " + this.checksum;
+      if ( File.extractExtension( sourcePath ).toLowerCase() == OUTPUT_EXTENSION )
+      {
+         let originalPath = sourcePath + ORIGINAL_SUFFIX;
+         if ( File.exists( originalPath ) )
+            return this.record( sourcePath, sourcePath, "skipped", "original kept for verification" );
+         if ( xisfCodec( sourcePath ) == this.codec )
+            return this.record( sourcePath, sourcePath, "skipped", "already " + this.codec );
+         let temporaryPath = this.writeTemporary( this.readSource( sourcePath ), sourcePath, outputFormat );
+         File.move( sourcePath, originalPath );
+         File.move( temporaryPath, sourcePath );
+         return this.record( originalPath, sourcePath, "converted", detail + ", recompressed" );
+      }
+
+      let outputPath = File.changeExtension( sourcePath, OUTPUT_EXTENSION );
+      if ( File.exists( outputPath ) && !this.overwriteExisting )
+         return this.record( sourcePath, outputPath, "skipped", "output exists" );
+      let temporaryPath = this.writeTemporary( this.readSource( sourcePath ), outputPath, outputFormat );
       if ( File.exists( outputPath ) )
          File.remove( outputPath );
       File.move( temporaryPath, outputPath );
-      this.record( sourcePath, outputPath, "converted", this.codec );
+      this.record( sourcePath, outputPath, "converted", detail );
    }
 
    run()
@@ -191,7 +249,7 @@ class ConversionEngine
          throw new Error( "No installed file format can write XISF files" );
       let files = this.collectFiles();
       console.show();
-      console.writeln( "<end><cbr><br>" + TITLE + ": " + files.length + " files, codec " + this.codec );
+      console.writeln( "<end><cbr><br>" + TITLE + ": " + files.length + " files, " + this.outputHints() );
       console.flush();
       for ( let index = 0; index < files.length; ++index )
       {
@@ -230,7 +288,7 @@ class ConversionDialog extends Dialog
       this.inputList.numberOfColumns = 1;
       this.inputList.headerVisible = false;
       this.inputList.multipleSelection = true;
-      this.inputList.setMinSize( 600, 250 );
+      this.inputList.setMinSize( 640, 250 );
 
       let addPath = ( path ) => {
          let node = new TreeBoxNode( this.inputList );
@@ -295,6 +353,13 @@ class ConversionDialog extends Dialog
       this.recursiveCheck.checked = engine.recursive;
       this.recursiveCheck.onCheck = ( checked ) => { engine.recursive = checked; };
 
+      this.recompressCheck = new CheckBox( this );
+      this.recompressCheck.text = "Recompress XISF";
+      this.recompressCheck.toolTip = "<p>Also rewrite .xisf files stored with another codec. The original is kept as " +
+                                     "&lt;name&gt;.xisf.orig until you delete it.</p>";
+      this.recompressCheck.checked = engine.recompress;
+      this.recompressCheck.onCheck = ( checked ) => { engine.recompress = checked; };
+
       this.overwriteCheck = new CheckBox( this );
       this.overwriteCheck.text = "Overwrite existing XISF";
       this.overwriteCheck.checked = engine.overwriteExisting;
@@ -307,6 +372,15 @@ class ConversionDialog extends Dialog
       this.extensionsEdit.text = engine.extensions.join( ";" );
       this.extensionsEdit.onEditCompleted = () => { engine.extensions = parseSuffixes( this.extensionsEdit.text ); };
 
+      this.checksSizer = new HorizontalSizer;
+      this.checksSizer.spacing = 8;
+      this.checksSizer.add( this.recursiveCheck );
+      this.checksSizer.add( this.recompressCheck );
+      this.checksSizer.add( this.overwriteCheck );
+      this.checksSizer.addStretch();
+      this.checksSizer.add( this.extensionsLabel );
+      this.checksSizer.add( this.extensionsEdit );
+
       this.codecLabel = new Label( this );
       this.codecLabel.text = "Compression:";
       this.codecLabel.textAlignment = TextAlignment.Right | TextAlignment.VertCenter;
@@ -316,15 +390,34 @@ class ConversionDialog extends Dialog
       this.codecCombo.currentItem = Math.max( 0, CODECS.indexOf( engine.codec ) );
       this.codecCombo.onItemSelected = ( index ) => { engine.codec = CODECS[index]; };
 
-      this.optionsSizer = new HorizontalSizer;
-      this.optionsSizer.spacing = 6;
-      this.optionsSizer.add( this.recursiveCheck );
-      this.optionsSizer.add( this.overwriteCheck );
-      this.optionsSizer.addStretch();
-      this.optionsSizer.add( this.extensionsLabel );
-      this.optionsSizer.add( this.extensionsEdit );
-      this.optionsSizer.add( this.codecLabel );
-      this.optionsSizer.add( this.codecCombo );
+      this.levelLabel = new Label( this );
+      this.levelLabel.text = "Level:";
+      this.levelLabel.textAlignment = TextAlignment.Right | TextAlignment.VertCenter;
+      this.levelSpin = new SpinBox( this );
+      this.levelSpin.minValue = 0;
+      this.levelSpin.maxValue = 100;
+      this.levelSpin.value = engine.level;
+      this.levelSpin.toolTip = "<p>Compression level 1-100, 0 uses the codec default.</p>";
+      this.levelSpin.onValueUpdated = ( value ) => { engine.level = value; };
+
+      this.checksumLabel = new Label( this );
+      this.checksumLabel.text = "Checksum:";
+      this.checksumLabel.textAlignment = TextAlignment.Right | TextAlignment.VertCenter;
+      this.checksumCombo = new ComboBox( this );
+      for ( let checksum of CHECKSUMS )
+         this.checksumCombo.addItem( checksum );
+      this.checksumCombo.currentItem = Math.max( 0, CHECKSUMS.indexOf( engine.checksum ) );
+      this.checksumCombo.onItemSelected = ( index ) => { engine.checksum = CHECKSUMS[index]; };
+
+      this.formatSizer = new HorizontalSizer;
+      this.formatSizer.spacing = 6;
+      this.formatSizer.addStretch();
+      this.formatSizer.add( this.codecLabel );
+      this.formatSizer.add( this.codecCombo );
+      this.formatSizer.add( this.levelLabel );
+      this.formatSizer.add( this.levelSpin );
+      this.formatSizer.add( this.checksumLabel );
+      this.formatSizer.add( this.checksumCombo );
 
       this.convertButton = new PushButton( this );
       this.convertButton.text = "Convert";
@@ -348,7 +441,8 @@ class ConversionDialog extends Dialog
       this.sizer.margin = 8;
       this.sizer.spacing = 8;
       this.sizer.add( this.listSizer, 100 );
-      this.sizer.add( this.optionsSizer );
+      this.sizer.add( this.checksSizer );
+      this.sizer.add( this.formatSizer );
       this.sizer.add( this.buttonsSizer );
       this.adjustToContents();
    }
@@ -361,7 +455,7 @@ function main()
 
    let engine = new ConversionEngine;
    let options = {};
-   for ( let argument of scriptArguments() )
+   for ( let argument of (Runtime.jsArguments || []) )
    {
       let text = String( argument );
       let split = text.indexOf( "=" );
@@ -374,10 +468,15 @@ function main()
       engine.inputs = File.readLines( options.list ).map( line => line.trim() ).filter( line => line.length && !line.startsWith( "#" ) );
       if ( options.manifest ) engine.manifestPath = options.manifest;
       if ( options.codec ) engine.codec = options.codec;
+      if ( options.level ) engine.level = parseInt( options.level );
+      if ( options.checksum ) engine.checksum = options.checksum;
       if ( options.extensions ) engine.extensions = parseSuffixes( options.extensions );
+      if ( options.recompress ) engine.recompress = options.recompress == "true";
       if ( options.overwrite ) engine.overwriteExisting = options.overwrite == "true";
       if ( CODECS.indexOf( engine.codec ) < 0 )
          throw new Error( "Unknown codec " + engine.codec + ", expected one of " + CODECS.join( ", " ) );
+      if ( CHECKSUMS.indexOf( engine.checksum ) < 0 )
+         throw new Error( "Unknown checksum " + engine.checksum + ", expected one of " + CHECKSUMS.join( ", " ) );
       engine.run();
       return;
    }
