@@ -1,14 +1,13 @@
 """Build the PixInsight update package: zip src/ and write updates/updates.xri with its SHA-1.
 
 Usage: python tools/build_package.py
-Run after signing every script (CodeSign writes a .xsgn next to each .js), then sign
-updates/updates.xri with CodeSign. PixInsight extracts the zip into its installation folder,
-so paths inside the zip start at src/.
+PixInsight extracts the zip into its installation folder, so paths inside the zip start at src/.
+Scripts and updates.xri are unsigned: PixInsight runs unsigned scripts, and signing needs a
+certified developer key.
 """
 import datetime
 import hashlib
 import pathlib
-import sys
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -37,9 +36,6 @@ XRI_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 
 def main():
     scripts = sorted(SOURCE.rglob("*.js"))
-    unsigned = [script for script in scripts if not script.with_suffix(".xsgn").exists()]
-    if unsigned:
-        sys.exit("Sign these with Script > Development > CodeSign first: " + ", ".join(str(path) for path in unsigned))
 
     release_date = datetime.date.today().strftime("%Y%m%d")
     package = UPDATES / f"{PACKAGE_PREFIX}{release_date}.zip"
@@ -56,7 +52,7 @@ def main():
         XRI_TEMPLATE.format(versions=PIXINSIGHT_VERSIONS, file_name=package.name, sha1=sha1,
                             release_date=release_date, scripts=names),
         encoding="utf-8")
-    print(f"{package.name} sha1 {sha1}, {len(scripts)} scripts. Now sign updates/updates.xri with CodeSign.")
+    print(f"{package.name} sha1 {sha1}, {len(scripts)} scripts")
 
 
 if __name__ == "__main__":

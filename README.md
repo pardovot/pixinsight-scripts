@@ -30,7 +30,7 @@ PixInsight.exe -n --automation-mode -r="<path>/BatchFormatConversionRecursive.js
 
 ## Releasing
 
-1. Sign each changed script with Script > Development > CodeSign (writes a `.xsgn` next to the `.js`).
-2. `python tools/build_package.py` zips `src/` into `updates/` and writes `updates/updates.xri`.
-3. Sign `updates/updates.xri` with CodeSign.
-4. Commit and push.
+1. `python tools/build_package.py` zips `src/` into `updates/` and writes `updates/updates.xri`.
+2. Commit and push.
+
+The package is unsigned. PixInsight runs unsigned scripts, signing would need a certified developer key.
