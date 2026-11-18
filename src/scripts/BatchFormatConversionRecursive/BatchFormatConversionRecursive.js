@@ -25,7 +25,7 @@
 
 #feature-info  Converts files and folders (recursively) to compressed XISF next to each source.
 
-#define VERSION            "1.1.1"
+#define VERSION            "1.1.2"
 #define TITLE              "BatchFormatConversionRecursive"
 #define DEFAULT_CODEC      "zstd+sh"
 #define DEFAULT_LEVEL      25
@@ -36,6 +36,8 @@
 #define ORIGINAL_SUFFIX    ".orig"
 #define HEADER_PROBE_BYTES 65536
 #define XISF_PREAMBLE_BYTES 16
+#define MANIFEST_ATTEMPTS  10
+#define MANIFEST_RETRY_MS  200
 
 CoreApplication.ensureMinimumVersion( 1, 9, 6 );
 
@@ -145,11 +147,28 @@ class ConversionEngine
       console.writeln( "<end><cbr>" + status + ": <raw>" + source + "</raw>" + (detail ? " (" + detail + ")" : "") );
       if ( this.manifestPath.length == 0 )
          return;
-      let manifest = new File;
-      manifest.openOrCreate( this.manifestPath );
-      manifest.seekEnd();
-      manifest.outTextLn( [ source, output, status, detail ].map( csvField ).join( "," ) );
-      manifest.close();
+      // Another program reading the manifest (or a network share) can briefly refuse the open, so
+      // retry, and never let a manifest problem end the run.
+      let line = [ source, output, status, detail ].map( csvField ).join( "," );
+      for ( let attempt = 1; ; ++attempt )
+         try
+         {
+            let manifest = new File;
+            manifest.openOrCreate( this.manifestPath );
+            manifest.seekEnd();
+            manifest.outTextLn( line );
+            manifest.close();
+            return;
+         }
+         catch ( error )
+         {
+            if ( attempt >= MANIFEST_ATTEMPTS )
+            {
+               console.warningln( "<end><cbr>** Could not write the manifest line for <raw>" + source + "</raw>: " + error.message );
+               return;
+            }
+            msleep( MANIFEST_RETRY_MS );
+         }
    }
 
    readSource( sourcePath )

@@ -4,7 +4,7 @@
       <p>pixinsight-scripts: scripts by Ofir Pardo, https://github.com/pardovot/pixinsight-scripts</p>
    </description>
    <platform os="all" arch="noarch" version="1.9.6:2.0.0">
-      <package fileName="pixinsight-scripts-20261118.zip" sha1="9c1d6b7267a6021e7545917b36c430bc358f5fd3" type="script" releaseDate="20261118">
+      <package fileName="pixinsight-scripts-20261119.zip" sha1="9141eaf2418e9252c2172b03cfe334469d2892fa" type="script" releaseDate="20261119">
          <title>pixinsight-scripts</title>
          <description>
             <p>BatchFormatConversionRecursive</p>
